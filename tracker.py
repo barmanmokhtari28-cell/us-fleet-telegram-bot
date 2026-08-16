@@ -11,8 +11,8 @@ LAST_POSTED_FILE = "last_posted.txt"
 
 def get_latest_article():
     """Extracts the latest fleet update URL and title."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    res = requests.get(SOURCE_URL, headers=headers)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    res = requests.get(SOURCE_URL, headers=headers, timeout=15)
     res.raise_for_status()
 
     soup = BeautifulSoup(res.text, "html.parser")
@@ -43,31 +43,37 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
     """Launches headless Chromium to take a screenshot and parse armada details."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width": 1440, "height": 1000})
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
-        page.goto(article_url, wait_until="networkidle")
+        
+        # Load page with DOMContentLoaded instead of networkidle to prevent timeout
+        page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(4000)  # Wait 4 seconds for images and fonts to render
 
         title = page.title().split(" - ")[0].strip()
 
         # Find and screenshot the armada map/infographic
-        map_img = page.locator("article img").first
+        map_img = page.locator("article img, .entry-content img").first
         if map_img.is_visible():
             map_img.screenshot(path=output_image)
         else:
-            page.locator("article").screenshot(path=output_image)
+            page.locator("article, .post").first.screenshot(path=output_image)
 
         # Extract ship/strike group locations
-        body_text = page.locator("article").inner_text()
+        body_text = page.locator("article, .entry-content").inner_text()
         deployments = []
         for line in body_text.splitlines():
             line = line.strip()
             if any(k in line.lower() for k in ["carrier strike group", "amphibious ready group", "uss "]):
-                if len(line) < 180 and line not in deployments:
+                if 10 < len(line) < 180 and line not in deployments:
                     deployments.append(f"🚢 {line}")
 
         browser.close()
 
-    summary_text = "\n".join(deployments[:6])
+    summary_text = "\n".join(deployments[:6]) if deployments else "Latest fleet movements available in report."
     caption = (
         f"⚓ *{title}*\n\n"
         f"*Live U.S. Armada / Strike Group Locations:*\n"
@@ -86,7 +92,7 @@ def send_telegram_alert(image_path, caption):
             "parse_mode": "Markdown"
         }
         files = {"photo": img}
-        res = requests.post(api_url, data=payload, files=files)
+        res = requests.post(api_url, data=payload, files=files, timeout=30)
         res.raise_for_status()
 
 
