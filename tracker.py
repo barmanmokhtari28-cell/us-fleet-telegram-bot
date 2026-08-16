@@ -1,3 +1,4 @@
+import html
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -48,37 +49,39 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = context.new_page()
-        
-        # Load page with DOMContentLoaded instead of networkidle to prevent timeout
+
         page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)  # Wait 4 seconds for images and fonts to render
+        page.wait_for_timeout(4000)  # Wait for images to render
 
         title = page.title().split(" - ")[0].strip()
 
-        # Find and screenshot the armada map/infographic
-        map_img = page.locator("article img, .entry-content img").first
+        # Find and screenshot the armada map/infographic image
+        map_img = page.locator(".entry-content img, .single56__post_content img, article img").first
         if map_img.is_visible():
             map_img.screenshot(path=output_image)
         else:
-            page.locator("article, .post").first.screenshot(path=output_image)
+            page.locator(".entry-content, .single56__post_content, #wi-content").first.screenshot(path=output_image)
 
-        # Extract ship/strike group locations
-        body_text = page.locator("article, .entry-content").inner_text()
+        # Extract text safely using .first to prevent strict-mode violations
+        content_elem = page.locator(".entry-content, .single56__post_content, #wi-content, article").first
+        body_text = content_elem.inner_text()
+
         deployments = []
         for line in body_text.splitlines():
             line = line.strip()
             if any(k in line.lower() for k in ["carrier strike group", "amphibious ready group", "uss "]):
                 if 10 < len(line) < 180 and line not in deployments:
-                    deployments.append(f"🚢 {line}")
+                    deployments.append(f"🚢 {html.escape(line)}")
 
         browser.close()
 
-    summary_text = "\n".join(deployments[:6]) if deployments else "Latest fleet movements available in report."
+    summary_text = "\n".join(deployments[:6]) if deployments else "Latest fleet movements available in full report."
+    
     caption = (
-        f"⚓ *{title}*\n\n"
-        f"*Live U.S. Armada / Strike Group Locations:*\n"
+        f"⚓ <b>{html.escape(title)}</b>\n\n"
+        f"<b>Live U.S. Armada / Strike Group Locations:</b>\n"
         f"{summary_text}\n\n"
-        f"🔗 [Full Deployment Source]({article_url})"
+        f"🔗 <a href='{article_url}'>Full Deployment Source</a>"
     )
     return output_image, caption
 
@@ -89,7 +92,7 @@ def send_telegram_alert(image_path, caption):
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "caption": caption,
-            "parse_mode": "Markdown"
+            "parse_mode": "HTML"
         }
         files = {"photo": img}
         res = requests.post(api_url, data=payload, files=files, timeout=30)
