@@ -51,18 +51,19 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
         page = context.new_page()
 
         page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)  # Wait for images to render
+        page.wait_for_timeout(4000)
 
-        title = page.title().split(" - ")[0].strip()
+        raw_title = page.title().split(" - ")[0].strip()
+        clean_title = raw_title.replace("USNI News Fleet and Marine Tracker:", "").strip()
 
-        # Find and screenshot the armada map/infographic image
+        # Find and screenshot the armada map/infographic
         map_img = page.locator(".entry-content img, .single56__post_content img, article img").first
         if map_img.is_visible():
             map_img.screenshot(path=output_image)
         else:
             page.locator(".entry-content, .single56__post_content, #wi-content").first.screenshot(path=output_image)
 
-        # Extract text safely using .first to prevent strict-mode violations
+        # Extract ship/strike group locations safely
         content_elem = page.locator(".entry-content, .single56__post_content, #wi-content, article").first
         body_text = content_elem.inner_text()
 
@@ -70,19 +71,24 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
         for line in body_text.splitlines():
             line = line.strip()
             if any(k in line.lower() for k in ["carrier strike group", "amphibious ready group", "uss "]):
-                if 10 < len(line) < 180 and line not in deployments:
-                    deployments.append(f"🚢 {html.escape(line)}")
+                if 12 < len(line) < 140 and line not in deployments:
+                    deployments.append(f"🔹 <i>{html.escape(line)}</i>")
 
         browser.close()
 
-    summary_text = "\n".join(deployments[:6]) if deployments else "Latest fleet movements available in full report."
-    
+    summary_text = "\n".join(deployments[:5]) if deployments else "🔹 <i>اطلاعات تکمیلی در گزارش USNI منتشر شد.</i>"
+
+    # Persian Rich Text Caption (No divider line)
     caption = (
-        f"⚓ <b>{html.escape(title)}</b>\n\n"
-        f"<b>Live U.S. Armada / Strike Group Locations:</b>\n"
+        f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
+        f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}</blockquote>\n\n"
+        f"📍 <b>موقعیت ناوهای هواپیمابر و گروه‌های رزمی:</b>\n"
         f"{summary_text}\n\n"
-        f"🔗 <a href='{article_url}'>Full Deployment Source</a>"
+        f"📫 @secretollah\n"
+        f"#USNI\n"
+        f"#ناو"
     )
+
     return output_image, caption
 
 
@@ -115,6 +121,6 @@ if __name__ == "__main__":
         print("Sending to Telegram...")
         send_telegram_alert(img, caption)
 
-        # Save memory
+        # Save memory state
         save_last_posted(latest_url)
         print("Done!")
