@@ -1,5 +1,6 @@
 import html
 import os
+from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -7,7 +8,6 @@ from playwright.sync_api import sync_playwright
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SOURCE_URL = "https://news.usni.org/category/fleet-tracker"
-LAST_POSTED_FILE = "last_posted.txt"
 
 
 def get_latest_article():
@@ -23,21 +23,6 @@ def get_latest_article():
 
     link_tag = article.find("a", href=True)
     return link_tag["href"], link_tag.get_text(strip=True)
-
-
-def has_already_been_posted(article_url):
-    """Checks if this specific report has already been sent to Telegram."""
-    if os.path.exists(LAST_POSTED_FILE):
-        with open(LAST_POSTED_FILE, "r") as f:
-            last_url = f.read().strip()
-            if last_url == article_url:
-                return True
-    return False
-
-
-def save_last_posted(article_url):
-    with open(LAST_POSTED_FILE, "w") as f:
-        f.write(article_url)
 
 
 def capture_fleet_data(article_url, output_image="armada_map.png"):
@@ -78,10 +63,14 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
 
     summary_text = "\n".join(deployments[:5]) if deployments else "🔹 <i>اطلاعات تکمیلی در گزارش USNI منتشر شد.</i>"
 
-    # Persian Rich Text Caption (No divider line)
+    # Current UTC time for live tracking tag
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Persian Rich Text Caption
     caption = (
         f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
-        f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}</blockquote>\n\n"
+        f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}\n"
+        f"🕒 <b>به‌روزرسانی:</b> {now_str}</blockquote>\n\n"
         f"📍 <b>موقعیت ناوهای هواپیمابر و گروه‌های رزمی:</b>\n"
         f"{summary_text}\n\n"
         f"📫 @secretollah\n"
@@ -110,17 +99,11 @@ if __name__ == "__main__":
         raise ValueError("Telegram Bot Token or Chat ID is missing!")
 
     latest_url, title = get_latest_article()
-    print(f"Checking report: {latest_url}")
+    print(f"Tracking report: {latest_url}")
 
-    if has_already_been_posted(latest_url):
-        print("This deployment report has already been posted. Skipping.")
-    else:
-        print("New armada deployment found! Taking screenshot...")
-        img, caption = capture_fleet_data(latest_url)
+    print("Capturing live fleet screenshot...")
+    img, caption = capture_fleet_data(latest_url)
 
-        print("Sending to Telegram...")
-        send_telegram_alert(img, caption)
-
-        # Save memory state
-        save_last_posted(latest_url)
-        print("Done!")
+    print("Sending live update to Telegram...")
+    send_telegram_alert(img, caption)
+    print("Update successfully delivered!")
