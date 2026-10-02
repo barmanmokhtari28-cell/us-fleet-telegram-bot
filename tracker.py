@@ -54,29 +54,54 @@ def meta(soup, prop):
     return tag["content"].strip() if tag and tag.get("content") else None
 
 
-def paragraphs_from_fragment(fragment_html):
-    frag = BeautifulSoup(fragment_html, "html.parser")
-    out = []
-    for p in frag.find_all("p"):
-        t = p.get_text(" ", strip=True)
-        if t.startswith("In addition to these major formations"):
+STOP_PREFIXES = ("In addition to these major formations", "Share to")
+
+
+def clean_text(el):
+    for br in el.find_all("br"):
+        br.replace_with(" ")
+    return re.sub(r"\s+", " ", el.get_text("")).strip()
+
+
+def is_caption(el, text):
+    """Photo captions / the italic intro line are not part of the report."""
+    if text.endswith(("Navy photo", "USNI News graphic", "Navy photo.")):
+        return True
+    em = el.find(["em", "i"])
+    return bool(em and re.sub(r"\s+", " ", em.get_text("")).strip() == text)
+
+
+def blocks_from(elements):
+    """Turns HTML elements into [(kind, text)] where kind is h2/h3/p/li/stats."""
+    blocks, seen_table = [], False
+    for el in elements:
+        if el.name == "table":
+            if not seen_table:
+                rows = el.find_all("tr")
+                if len(rows) >= 2:
+                    cells = [clean_text(c) for c in rows[1].find_all(["td", "th"])]
+                    blocks.append(("stats", cells))
+                    seen_table = True
+            continue
+        text = clean_text(el)
+        if not text:
+            continue
+        if text.startswith(STOP_PREFIXES):
             break
-        out.append(t)
-    return out
+        if el.name in ("p", "li") and is_caption(el, text):
+            continue
+        blocks.append((el.name, text))
+    return blocks
+
+
+TAGS = ["h2", "h3", "p", "li", "table"]
 
 
 def source_article_page(url, **_):
     soup = BeautifulSoup(fetch(url).text, "html.parser")
     h1 = soup.find("h1")
-    paras = []
-    for el in (h1 or soup).find_all_next("p"):
-        t = el.get_text(" ", strip=True)
-        if t.startswith("In addition to these major formations"):
-            break
-        paras.append(t)
-    img = meta(soup, "og:image")
     title = meta(soup, "og:title") or (h1.get_text(strip=True) if h1 else "")
-    return title, img, paras
+    return title, meta(soup, "og:image"), blocks_from((h1 or soup).find_all_next(TAGS))
 
 
 def source_rest_api(url, **_):
@@ -94,7 +119,7 @@ def source_rest_api(url, **_):
     if not img:
         m = re.search(r'<img[^>]+src="([^"]+)"', content)
         img = m.group(1) if m else None
-    return title, img, paragraphs_from_fragment(content)
+    return title, img, blocks_from(BeautifulSoup(content, "html.parser").find_all(TAGS))
 
 
 def source_rss(url, **_):
@@ -105,7 +130,8 @@ def source_rss(url, **_):
             content = item.find("content:encoded") or item.find("description")
             frag = content.get_text() if content else ""
             m = re.search(r'<img[^>]+src="([^"]+)"', frag)
-            return item.find("title").get_text(strip=True), (m.group(1) if m else None), paragraphs_from_fragment(frag)
+            blocks = blocks_from(BeautifulSoup(frag, "html.parser").find_all(TAGS))
+            return item.find("title").get_text(strip=True), (m.group(1) if m else None), blocks
     raise Exception("report not in RSS feed")
 
 
@@ -124,8 +150,8 @@ def source_category_page(url, title="", category_soup=None, **_):
                 if not src and img.get("srcset"):
                     src = img["srcset"].split()[0]
                 src = re.sub(r"-\d+x\d+(\.\w+)$", r"\1", src)  # full-size version
-                paras = [p.get_text(" ", strip=True) for p in node.find_all("p")]
-                return title, src, paras
+                blocks = [("p", clean_text(p)) for p in node.find_all("p")]
+                return title, src, blocks
     raise Exception("report not found on category page")
 
 
@@ -146,44 +172,127 @@ def get_report(url, title, category_soup):
     raise Exception("All sources failed.")
 
 
-# ---------------------------------------------------------------- caption / image
-def first_sentence(text, limit=130):
-    text = re.sub(r"\s+", " ", text).strip()
-    m = re.match(r"(.+?[.!?])(\s|$)", text)
-    s = m.group(1) if m else text
-    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+# ---------------------------------------------------------------- formatting
+REGION_FA = {
+    "japan": ("🇯🇵", "ژاپن"),
+    "eastern pacific": ("🌅", "شرق اقیانوس آرام"),
+    "western pacific": ("🌏", "غرب اقیانوس آرام"),
+    "pacific": ("🌊", "اقیانوس آرام"),
+    "caribbean": ("🏝", "دریای کارائیب"),
+    "mediterranean": ("🏛", "دریای مدیترانه"),
+    "red sea": ("🔴", "دریای سرخ"),
+    "arabian sea": ("🛢", "دریای عرب"),
+    "persian gulf": ("⛽", "خلیج فارس"),
+    "gulf of oman": ("⚓", "خلیج عمان"),
+    "indian ocean": ("🌴", "اقیانوس هند"),
+    "atlantic": ("🌐", "اقیانوس اطلس"),
+    "south china sea": ("🧭", "دریای چین جنوبی"),
+    "philippine sea": ("🧭", "دریای فیلیپین"),
+    "east china sea": ("🧭", "دریای چین شرقی"),
+    "korea": ("🇰🇷", "کره"),
+    "europe": ("🇪🇺", "اروپا"),
+    "baltic": ("🧊", "دریای بالتیک"),
+    "black sea": ("🌊", "دریای سیاه"),
+}
+SQUADRON_RE = re.compile(r"\b(VFA|VAQ|VAW|VRM|VMFA|HSM|HSC|HM|VAQ|Squadron \(|Air Wing)\b|Squadron \(")
+E = html.escape
 
 
-def build_caption(title, paras):
+def region_style(title):
+    low = title.lower()
+    for key, (emoji, fa) in REGION_FA.items():
+        if key in low:
+            return emoji, fa
+    return "📍", None
+
+
+def parse_report(blocks):
+    stats, sections, cur = None, [], None
+    for kind, text in blocks:
+        if kind == "stats":
+            stats = text
+        elif kind == "h2":
+            cur = {"title": re.sub(r"^In (the )?", "", text).strip(), "items": []}
+            sections.append(cur)
+        else:
+            if cur is None:
+                cur = {"title": "", "items": []}
+                sections.append(cur)
+            if kind == "h3":
+                cur["items"].append(("sub", text))
+            elif kind == "li":
+                if SQUADRON_RE.search(text):
+                    continue  # skip air-wing squadron lists, keep ship lists
+                cur["items"].append(("li", re.sub(r",? homeported.*$", "", text).rstrip(".")))
+            elif kind == "p":
+                if len(text) < 30:
+                    continue  # headings like "Carrier Air Wing 9", "Air Defense Commander"
+                cur["items"].append(("p", text))
+    return stats, [s for s in sections if s["items"]]
+
+
+def render_section(sec):
+    emoji, fa = region_style(sec["title"])
+    head = f"{emoji} <b>{E(sec['title'])}</b>" if sec["title"] else "📍 <b>Overview</b>"
+    if fa:
+        head = f"{emoji} <b>{fa}</b> · <i>{E(sec['title'])}</i>"
+    parts, prev = [], None
+    for kind, text in sec["items"]:
+        if kind == "sub":
+            parts.append(f"\n🔸 <b>{E(text)}</b>")
+        elif kind == "li":
+            parts.append(("" if prev == "li" else "") + f"▫️ {E(text)}")
+        else:
+            parts.append(("\n" if prev not in (None, "sub") else "") + E(text))
+        prev = kind
+    # keep list items on consecutive lines, paragraphs separated by blank lines
+    body = "\n".join(parts).strip()
+    tag = "blockquote expandable" if len(body) > 700 else "blockquote"
+    return f"{head}\n<{tag}>{body}</{tag}>"
+
+
+def stat_numbers(stats):
+    nums = []
+    for c in stats or []:
+        m = re.match(r"\s*(\d+)", c)
+        nums.append(m.group(1) if m else c)
+    return nums
+
+
+def build_caption(title, stats):
     clean_title = title.split(" - ")[0].replace("USNI News Fleet and Marine Tracker:", "").strip()
-    keys = ["carrier strike group", "amphibious ready group", "aircraft carrier", "uss "]
-    priority, others = [], []
-    for text in paras:
-        low = text.lower()
-        if len(text) < 25 or not any(k in low for k in keys):
-            continue
-        item = f"🔹 <i>{html.escape(first_sentence(text))}</i>"
-        if item in priority or item in others:
-            continue
-        (priority if ("carrier" in low or "strike group" in low or "ready group" in low) else others).append(item)
-    lines = (priority + others)[:4]
-
-    def make(lines):
-        summary = "\n".join(lines) if lines else "🔹 <i>اطلاعات تکمیلی در گزارش USNI منتشر شد.</i>"
-        return (
-            f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
-            f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}</blockquote>\n\n"
-            f"📍 <b>موقعیت ناوهای هواپیمابر و گروه‌های رزمی:</b>\n{summary}\n\n"
-            f"📫 @secretollah\n#USNI\n#ناو"
-        )
-
-    caption = make(lines)
-    while len(caption) > 1024 and lines:  # Telegram caption limit
-        lines.pop()
-        caption = make(lines)
-    return caption
+    lines = [
+        "🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>",
+        f"<blockquote><b>📅 گزارش USNI:</b> {E(clean_title)}</blockquote>",
+    ]
+    n = stat_numbers(stats)
+    if len(n) >= 3:
+        lines += [
+            "",
+            f"⚓️ کل ناوگان: <b>{n[0]}</b>  |  🌐 مستقر: <b>{n[1]}</b>  |  🌊 در حال حرکت: <b>{n[2]}</b>",
+        ]
+    lines += ["", "👇 جزئیات کامل موقعیت‌ها در پیام بعدی", "", "📫 @secretollah", "#USNI #ناو"]
+    return "\n".join(lines)
 
 
+def build_messages(sections, clean_title):
+    """Splits the rendered sections into Telegram messages under the 4096-char limit."""
+    rendered = [render_section(s) for s in sections]
+    messages, cur = [], ""
+    for r in rendered:
+        if cur and len(cur) + len(r) + 2 > 3800:
+            messages.append(cur)
+            cur = ""
+        cur = f"{cur}\n\n{r}" if cur else r
+    if cur:
+        messages.append(cur)
+    if messages:
+        messages[0] = f"📋 <b>گزارش کامل ناوگان</b> — <i>{E(clean_title)}</i>\n\n" + messages[0]
+        messages[-1] += "\n\n📫 @secretollah\n#USNI #ناو"
+    return messages
+
+
+# ---------------------------------------------------------------- telegram
 def download_image(img_url, path="armada_map.jpg"):
     try:
         res = session.get(img_url, timeout=30, headers={"Accept": "image/*,*/*;q=0.8"})
@@ -196,17 +305,25 @@ def download_image(img_url, path="armada_map.jpg"):
         return None
 
 
-def send_telegram_alert(img_url, local_path, caption):
-    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+def tg(method, **kw):
+    res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", timeout=60, **kw)
+    if not res.ok:
+        raise Exception(f"Telegram {method} error {res.status_code}: {res.text}")
+
+
+def send_photo(img_url, local_path, caption):
     data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
     if local_path:
         with open(local_path, "rb") as f:
-            res = requests.post(api, data=data, files={"photo": f}, timeout=60)
+            tg("sendPhoto", data=data, files={"photo": f})
     else:
-        data["photo"] = img_url  # Telegram's servers download it, bypassing the runner's IP block
-        res = requests.post(api, data=data, timeout=60)
-    if not res.ok:
-        raise Exception(f"Telegram error {res.status_code}: {res.text}")
+        data["photo"] = img_url  # Telegram fetches it itself, bypassing the runner's IP block
+        tg("sendPhoto", data=data)
+
+
+def send_text(text):
+    tg("sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+                            "disable_web_page_preview": "true"})
 
 
 if __name__ == "__main__":
@@ -220,10 +337,19 @@ if __name__ == "__main__":
         print("This deployment report has already been posted. Skipping.")
     else:
         print("New armada deployment found!")
-        full_title, img_url, paras = get_report(latest_url, title, cat_soup)
-        caption = build_caption(full_title, paras)
+        import time
+        full_title, img_url, blocks = get_report(latest_url, title, cat_soup)
+        stats, sections = parse_report(blocks)
+        clean_title = full_title.split(" - ")[0].replace("USNI News Fleet and Marine Tracker:", "").strip()
+        caption = build_caption(full_title, stats)
+        messages = build_messages(sections, clean_title)
+        print(f"Parsed {len(sections)} sections -> {len(messages)} message(s)")
+
         local = download_image(img_url)
         print("Sending to Telegram...")
-        send_telegram_alert(img_url, local, caption)
+        send_photo(img_url, local, caption)
+        for m in messages:
+            time.sleep(1)
+            send_text(m)
         save_last_posted(latest_url)
         print("Done!")
