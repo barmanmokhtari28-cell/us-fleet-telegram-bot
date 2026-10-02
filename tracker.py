@@ -40,6 +40,9 @@ def get_latest_article():
 
 
 def has_already_been_posted(url):
+    if os.environ.get("FORCE_POST") == "true":
+        print("FORCE_POST enabled: ignoring last_posted.txt")
+        return False
     return os.path.exists(LAST_POSTED_FILE) and open(LAST_POSTED_FILE).read().strip() == url
 
 
