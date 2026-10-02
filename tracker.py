@@ -250,8 +250,8 @@ def render_section(sec):
         prev = kind
     # keep list items on consecutive lines, paragraphs separated by blank lines
     body = "\n".join(parts).strip()
-    tag = "blockquote expandable" if len(body) > 700 else "blockquote"
-    return f"{head}\n<{tag}>{body}</{tag}>"
+    open_tag = "<blockquote expandable>" if len(body) > 700 else "<blockquote>"
+    return f"{head}\n{open_tag}{body}</blockquote>"
 
 
 def stat_numbers(stats):
@@ -325,8 +325,17 @@ def send_photo(img_url, local_path, caption):
 
 
 def send_text(text):
-    tg("sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
-                            "disable_web_page_preview": "true"})
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": "true"}
+    try:
+        tg("sendMessage", data=data)
+    except Exception as e:
+        if "can't parse entities" not in str(e):
+            raise
+        print("  HTML parse error, resending as plain text")
+        data["text"] = html.unescape(re.sub(r"</?[a-z][^>]*>", "", text))
+        del data["parse_mode"]
+        tg("sendMessage", data=data)
 
 
 if __name__ == "__main__":
