@@ -1,37 +1,46 @@
 import html
 import os
+import re
 import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SOURCE_URL = "https://news.usni.org/category/fleet-tracker"
 LAST_POSTED_FILE = "last_posted.txt"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
+
+def fetch(url, **kw):
+    res = requests.get(url, headers=HEADERS, timeout=30, **kw)
+    res.raise_for_status()
+    return res
 
 
 def get_latest_article():
-    """Extracts the latest fleet update URL and title."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    res = requests.get(SOURCE_URL, headers=headers, timeout=15)
-    res.raise_for_status()
+    """Returns the URL of the newest Fleet and Marine Tracker post."""
+    soup = BeautifulSoup(fetch(SOURCE_URL).text, "html.parser")
 
-    soup = BeautifulSoup(res.text, "html.parser")
+    # Most robust: first link that looks like a tracker report (page is newest-first)
+    for a in soup.find_all("a", href=True):
+        if re.search(r"/\d{4}/\d{2}/\d{2}/usni-news-fleet-and-marine-tracker", a["href"]):
+            return a["href"], a.get_text(strip=True)
+
+    # Fallback to the old logic
     article = soup.find("article") or soup.find("div", class_="post")
     if not article:
         raise Exception("Could not find any fleet reports.")
-
     link_tag = article.find("a", href=True)
     return link_tag["href"], link_tag.get_text(strip=True)
 
 
 def has_already_been_posted(article_url):
-    """Checks if this specific report has already been sent to Telegram."""
     if os.path.exists(LAST_POSTED_FILE):
         with open(LAST_POSTED_FILE, "r") as f:
-            last_url = f.read().strip()
-            if last_url == article_url:
-                return True
+            return f.read().strip() == article_url
     return False
 
 
@@ -40,45 +49,67 @@ def save_last_posted(article_url):
         f.write(article_url)
 
 
-def capture_fleet_data(article_url, output_image="armada_map.png"):
-    """Launches headless Chromium to take a screenshot and parse armada details."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            viewport={"width": 1440, "height": 1000},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
+def meta(soup, prop):
+    tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
+    return tag["content"].strip() if tag and tag.get("content") else None
 
-        page.goto(article_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)
 
-        raw_title = page.title().split(" - ")[0].strip()
-        clean_title = raw_title.replace("USNI News Fleet and Marine Tracker:", "").strip()
+def first_sentence(text, limit=130):
+    text = re.sub(r"\s+", " ", text).strip()
+    m = re.match(r"(.+?[.!?])(\s|$)", text)
+    s = m.group(1) if m else text
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
 
-        # Find and screenshot the armada map/infographic
-        map_img = page.locator(".entry-content img, .single56__post_content img, article img").first
-        if map_img.is_visible():
-            map_img.screenshot(path=output_image)
+
+def capture_fleet_data(article_url, output_image="armada_map.jpg"):
+    """Downloads the tracker map image and extracts key deployment lines (no browser needed)."""
+    soup = BeautifulSoup(fetch(article_url).text, "html.parser")
+
+    # --- Title ---
+    h1 = soup.find("h1")
+    raw_title = (meta(soup, "og:title") or (h1.get_text(strip=True) if h1 else "")
+                 or (soup.title.get_text() if soup.title else "")).split(" - ")[0].strip()
+    clean_title = raw_title.replace("USNI News Fleet and Marine Tracker:", "").strip()
+
+    # --- Map image: og:image is the tracker graphic (FT_x_xx_xx.jpg) ---
+    img_url = meta(soup, "og:image")
+    if not img_url:
+        for img in soup.find_all("img", src=True):
+            if "/wp-content/uploads/" in img["src"] and "FT_" in img["src"]:
+                img_url = img["src"]
+                break
+    if not img_url:
+        raise Exception("Could not find the fleet map image on the page.")
+    with open(output_image, "wb") as f:
+        f.write(fetch(img_url).content)
+
+    # --- Deployment text: everything between the title and the closing disclaimer ---
+    lines = []
+    start = h1 or soup
+    for el in start.find_all_next(["p", "li", "h2", "h3"]):
+        text = el.get_text(" ", strip=True)
+        if text.startswith("In addition to these major formations") or text.startswith("Share to"):
+            break
+        lines.append((el.name, text))
+
+    keys = ["carrier strike group", "amphibious ready group", "aircraft carrier", "uss "]
+    priority, others = [], []
+    for name, text in lines:
+        low = text.lower()
+        if name != "p" or not any(k in low for k in keys) or len(text) < 25:
+            continue
+        s = first_sentence(text)
+        item = f"🔹 <i>{html.escape(s)}</i>"
+        if item in priority or item in others:
+            continue
+        if "carrier" in low or "strike group" in low or "ready group" in low:
+            priority.append(item)
         else:
-            page.locator(".entry-content, .single56__post_content, #wi-content").first.screenshot(path=output_image)
+            others.append(item)
+    deployments = (priority + others)[:4]
 
-        # Extract ship/strike group locations safely
-        content_elem = page.locator(".entry-content, .single56__post_content, #wi-content, article").first
-        body_text = content_elem.inner_text()
+    summary_text = "\n".join(deployments) if deployments else "🔹 <i>اطلاعات تکمیلی در گزارش USNI منتشر شد.</i>"
 
-        deployments = []
-        for line in body_text.splitlines():
-            line = line.strip()
-            if any(k in line.lower() for k in ["carrier strike group", "amphibious ready group", "uss "]):
-                if 12 < len(line) < 140 and line not in deployments:
-                    deployments.append(f"🔹 <i>{html.escape(line)}</i>")
-
-        browser.close()
-
-    summary_text = "\n".join(deployments[:5]) if deployments else "🔹 <i>اطلاعات تکمیلی در گزارش USNI منتشر شد.</i>"
-
-    # Persian Rich Text Caption (No divider line)
     caption = (
         f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
         f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}</blockquote>\n\n"
@@ -88,6 +119,16 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
         f"#USNI\n"
         f"#ناو"
     )
+    # Telegram photo captions are capped at 1024 characters
+    while len(caption) > 1024 and deployments:
+        deployments.pop()
+        summary_text = "\n".join(deployments)
+        caption = (
+            f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
+            f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}</blockquote>\n\n"
+            f"📍 <b>موقعیت ناوهای هواپیمابر و گروه‌های رزمی:</b>\n"
+            f"{summary_text}\n\n📫 @secretollah\n#USNI\n#ناو"
+        )
 
     return output_image, caption
 
@@ -95,14 +136,14 @@ def capture_fleet_data(article_url, output_image="armada_map.png"):
 def send_telegram_alert(image_path, caption):
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     with open(image_path, "rb") as img:
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "caption": caption,
-            "parse_mode": "HTML"
-        }
-        files = {"photo": img}
-        res = requests.post(api_url, data=payload, files=files, timeout=30)
-        res.raise_for_status()
+        res = requests.post(
+            api_url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": img},
+            timeout=60,
+        )
+    if not res.ok:
+        raise Exception(f"Telegram error {res.status_code}: {res.text}")
 
 
 if __name__ == "__main__":
@@ -115,12 +156,11 @@ if __name__ == "__main__":
     if has_already_been_posted(latest_url):
         print("This deployment report has already been posted. Skipping.")
     else:
-        print("New armada deployment found! Taking screenshot...")
+        print("New armada deployment found! Fetching map...")
         img, caption = capture_fleet_data(latest_url)
 
         print("Sending to Telegram...")
         send_telegram_alert(img, caption)
 
-        # Save memory state
         save_last_posted(latest_url)
         print("Done!")
