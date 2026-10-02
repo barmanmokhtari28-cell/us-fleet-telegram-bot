@@ -5,6 +5,11 @@ on:
     # Every 6 hours starting 09:00 Iran time (05:30, 11:30, 17:30, 23:30 UTC)
     - cron: '30 5,11,17,23 * * *'
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-post the latest report even if already posted'
+        type: boolean
+        default: false
 
 jobs:
   track-and-post:
@@ -27,6 +32,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_POST: ${{ inputs.force }}
         run: python tracker.py
 
       - name: Save last posted report
