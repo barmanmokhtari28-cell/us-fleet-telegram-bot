@@ -1,5 +1,6 @@
 import html
 import os
+import re
 from datetime import datetime, timezone
 import requests
 from playwright.sync_api import sync_playwright
@@ -7,73 +8,117 @@ from playwright.sync_api import sync_playwright
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SOURCE_URL = "https://news.usni.org/category/fleet-tracker"
+OUTPUT_IMAGE = "armada_map.png"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+}
 
 
-def run_tracker():
+def fetch_via_proxy_reader(url):
+    """Uses the free Jina Reader proxy to bypass Cloudflare Turnstile challenges."""
+    reader_url = f"https://r.jina.ai/{url}"
+    res = requests.get(reader_url, headers=HEADERS, timeout=30)
+    res.raise_for_status()
+    return res.text
+
+
+def get_data_via_proxy():
+    """Extracts article content, strike group deployments, and direct map image URL."""
+    print("Fetching fleet archive via reader proxy...")
+    archive_text = fetch_via_proxy_reader(SOURCE_URL)
+
+    # Locate latest fleet tracker article link
+    links = re.findall(r"https://news\.usni\.org/\d{4}/\d{2}/\d{2}/[a-zA-Z0-9\-]+", archive_text)
+    tracker_links = [l for l in links if "fleet-and-marine-tracker" in l]
+
+    if not tracker_links:
+        raise Exception("Could not locate tracker link in archive.")
+
+    latest_url = tracker_links[0]
+    print(f"Latest report: {latest_url}")
+
+    # Fetch report content
+    article_text = fetch_via_proxy_reader(latest_url)
+
+    # Extract title
+    title_match = re.search(r"Title:\s*(.+)", article_text)
+    raw_title = title_match.group(1).strip() if title_match else "Fleet Tracker"
+    clean_title = raw_title.replace("USNI News Fleet and Marine Tracker:", "").strip()
+
+    # Extract original high-res armada infographic map
+    img_candidates = re.findall(r"https://news\.usni\.org/wp-content/uploads/[^\s\)\"\'\<\>]+\.(?:png|jpg|jpeg)", article_text)
+    map_url = None
+    for img in img_candidates:
+        if not any(x in img.lower() for x in ["logo", "avatar", "icon", "banner", "author"]):
+            map_url = img
+            break
+
+    if not map_url:
+        raise Exception("Could not find high-res armada map image.")
+
+    print(f"Downloading original fleet map: {map_url}")
+    img_res = requests.get(map_url, headers=HEADERS, timeout=30)
+    img_res.raise_for_status()
+    with open(OUTPUT_IMAGE, "wb") as f:
+        f.write(img_res.content)
+
+    # Extract strike groups and deployments
+    deployments = []
+    for line in article_text.splitlines():
+        line = line.strip()
+        if any(k in line.lower() for k in ["carrier strike group", "amphibious ready group", "uss "]):
+            # Clean markdown formatting like brackets or leading dashes
+            clean_line = re.sub(r"^[-\*\#\s\d\.]+", "", line).strip()
+            if 12 < len(clean_line) < 140 and clean_line not in deployments:
+                deployments.append(f"🔹 <i>{html.escape(clean_line)}</i>")
+
+    return clean_title, deployments
+
+
+def get_data_via_stealth_playwright():
+    """Fallback method using stealth headless browser with Turnstile solver."""
+    print("Using stealth browser fallback...")
     with sync_playwright() as p:
-        # Launch real browser instance to bypass Cloudflare/WAF 403 blocks
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ]
+        )
         context = browser.new_context(
             viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            user_agent=HEADERS["User-Agent"]
         )
+        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
-        # 1. Navigate to Fleet Tracker archive
-        print("Navigating to Fleet Tracker archive...")
         page.goto(SOURCE_URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(3000)
 
-        # 2. Extract latest report URL
-        report_link = None
-        for a in page.locator("a").all():
-            href = a.get_attribute("href") or ""
-            if "fleet-and-marine-tracker" in href:
-                report_link = href
+        # Handle Cloudflare verification if it appears
+        for _ in range(8):
+            title = page.title().lower()
+            if "security verification" in title or "just a moment" in title:
+                print("Cloudflare verification screen detected. Attempting to click...")
+                for frame in page.frames:
+                    try:
+                        box = frame.locator("input[type='checkbox'], #challenge-stage, .ctp-checkbox-label").first
+                        if box.is_visible():
+                            box.click()
+                            page.wait_for_timeout(4000)
+                            break
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2000)
+            else:
                 break
 
-        if not report_link:
-            # Fallback to first article heading link
-            first_article_link = page.locator("article a, .post a, h2 a").first
-            report_link = first_article_link.get_attribute("href")
-
-        if not report_link:
-            raise Exception("Could not find any fleet report link on the page.")
-
-        print(f"Tracking report: {report_link}")
-
-        # 3. Navigate to the article
-        page.goto(report_link, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)
-
-        # 4. Extract and clean title
-        raw_title = page.title().split(" - ")[0].strip()
-        clean_title = raw_title.replace("USNI News Fleet and Marine Tracker:", "").strip()
-
-        # 5. Capture the armada map
-        output_image = "armada_map.png"
-        map_captured = False
-
-        # Attempt to find the specific fleet infographic image
-        candidate_images = page.locator("img").all()
-        for img in candidate_images:
-            src = img.get_attribute("src") or ""
-            if "uploads" in src and not any(x in src.lower() for x in ["logo", "avatar", "icon", "banner"]):
-                try:
-                    img.screenshot(path=output_image, timeout=5000)
-                    map_captured = True
-                    print(f"Captured fleet map element: {src}")
-                    break
-                except Exception:
-                    continue
-
-        if not map_captured:
-            # Fallback to high-res page screenshot
-            print("Taking viewport screenshot...")
-            page.screenshot(path=output_image)
-
-        # 6. Extract ship and strike group movements
+        page.screenshot(path=OUTPUT_IMAGE)
+        clean_title = page.title().split(" - ")[0].replace("USNI News Fleet and Marine Tracker:", "").strip()
         body_text = page.inner_text("body")
+
         deployments = []
         for line in body_text.splitlines():
             line = line.strip()
@@ -82,12 +127,14 @@ def run_tracker():
                     deployments.append(f"🔹 <i>{html.escape(line)}</i>")
 
         browser.close()
+        return clean_title, deployments
 
+
+def build_caption(clean_title, deployments):
     summary_text = "\n".join(deployments[:5]) if deployments else "🔹 <i>اطلاعات تکمیلی در نقشه گزارش USNI درج شده است.</i>"
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Persian Rich Text Caption
-    caption = (
+    return (
         f"🧭 <b>آخرین موقعیت ناوگان و ناوهای جنگی آمریکا</b>\n"
         f"<blockquote><b>گزارش:</b> {html.escape(clean_title)}\n"
         f"🕒 <b>به‌روزرسانی:</b> {now_str}</blockquote>\n\n"
@@ -97,8 +144,6 @@ def run_tracker():
         f"#USNI\n"
         f"#ناو"
     )
-
-    return output_image, caption
 
 
 def send_telegram_alert(image_path, caption):
@@ -120,8 +165,14 @@ if __name__ == "__main__":
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise ValueError("Telegram Bot Token or Chat ID is missing!")
 
-    img, caption = run_tracker()
+    try:
+        title, deployments = get_data_via_proxy()
+    except Exception as e:
+        print(f"Proxy method encountered an issue ({e}). Switching to stealth browser...")
+        title, deployments = get_data_via_stealth_playwright()
 
-    print("Sending live update to Telegram...")
-    send_telegram_alert(img, caption)
+    caption = build_caption(title, deployments)
+
+    print("Posting clean armada update to Telegram...")
+    send_telegram_alert(OUTPUT_IMAGE, caption)
     print("Update successfully delivered!")
